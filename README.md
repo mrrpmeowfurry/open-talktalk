@@ -1,5 +1,5 @@
 # open-talktalk
-[![Discord](https://img.shields.io/discord/SERVER_ID?label=Discord)](https://discord.gg/T5MF85vX5r)
+[![Discord](https://img.shields.io/discord/1471472522594881644?label=Discord)](https://discord.gg/T5MF85vX5r)
 
 basically i'm reverse engineering the [TalkTalk client](https://web.archive.org/web/20160319124007/http://cdn.th.garenanow.com/talktalk/installer/TalkTalk_FullInstall_th.exe) (2016-03-19)
 , figuring out how it talked to
