@@ -16,6 +16,7 @@ the client talks to my server now.
 i redirected the dead server `live.imconnect.garenanow.com` to my own server. (hosts file + a python socket server).
 
 captured the login packets and i already made it pop up any error the client has `0x21`, `0x66`, etc
+
 <img src="docs/img/e066.png" width="350">
 
 a good chunk of the docs is me guessing stuff - see [docs/PROTOCOL.md](docs/PROTOCOL.md)
