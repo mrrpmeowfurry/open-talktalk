@@ -1,17 +1,64 @@
 # talktalk protocol notes
 
 my notes from reverse engineering `GarenaMessenger.exe` (the talktalk / garena
-plus messenger client). all of this is from staring at it in ghidra + poking
-the binaries with `strings` and `grep`. the servers are dead so nothing's been
-tested against a real one. anything i say "probably/maybe/i think" is a guess,
-not fact. if you know better, pr it.
+plus messenger client). a lot of this is from staring at it in ghidra + poking
+the binaries with `strings` and `grep`, but a good chunk is now confirmed against
+the **live client** (i redirected the dead hostname to my own machine with the
+windows hosts file + a python tcp listener on port 9100). stuff marked "confirmed
+live" came from real captured packets. anything i say "probably/maybe/i think" is
+a guess, not fact. if you know better, pr it.
 
 heads up: this is the messenger client, which is newer than the old garena
 room/game client that people reversed years ago (the "gcb" wc3/l4d tunneling
 stuff). that old writeup is handy but it doesn't match this client. the old one
 used AES, this one uses XTEA. the old one had a 2048-bit shared RSA key, this one
-has a different 1024-bit key. and this client sends login as JSON, not the old
-binary blobs. so use the old docs as a hint, not gospel.
+has a different 1024-bit key. so use the old docs as a hint, not gospel.
+
+also important: the http/json stuff is just config/version/status checks. the
+ACTUAL login is the raw binary TCP connection (see below). don't get those mixed up.
+
+
+## the big picture (how login actually works)
+
+confirmed flow, from watching the live client:
+
+1. on launch + login the client makes some http(s) calls for config / version /
+   server status. these are just checks, not the login itself.
+2. the real login is a **raw binary TCP connection** to
+   **`live.imconnect.garenanow.com:9100`**. this is where all the actual auth +
+   chat + everything happens.
+3. that hostname is dead now, so the client can't connect -> Winsock error 10049
+   -> shows "cannot connect with Garena+ server".
+
+to talk to the client yourself: point `live.imconnect.garenanow.com` at your own
+machine via the windows hosts file, run a tcp server on port 9100, and the client
+connects straight to you. no http involved for this part.
+
+
+## the connection target (CONFIRMED LIVE via x32dbg)
+
+the client opens its real login socket to:
+
+```
+live.imconnect.garenanow.com : 9100
+```
+
+- these come from config keys `im_server_domain` and `im_server_port`, read at
+  runtime. NOT a hardcoded string, NOT in any config file on disk, NOT in the
+  downloaded xml configs — it's seeded at runtime somewhere.
+- confirmed by breakpointing the config-load function in x32dbg and reading the
+  returned value live. it was NOT empty like i first assumed — it literally
+  returns `live.imconnect.garenanow.com`, and the port returns 9100.
+
+### x32dbg address math (write this down)
+
+ghidra assumes base `0x00400000`. the module actually loaded at `0x00B90000`. so:
+
+```
+runtime address = ghidra address + 0x790000
+```
+
+example: `IMServer_LoadConfig` at ghidra `0x0044c510` -> runtime `0x00BDC510`.
 
 
 ## where the code actually is
@@ -52,27 +99,34 @@ other binaries in the install i haven't touched yet but matter later:
 | `RSALib.dll` | rsa stuff for the key exchange |
 
 
-## how it's put together
+## the TCP wire format (CONFIRMED LIVE)
 
-two stages, pretty standard for messengers of this era:
+every packet on the IM TCP connection is framed like:
 
-1. login over http(s). it uses wininet (`InternetConnectW`, `HttpOpenRequestW`,
-   `HttpSendRequestW`, `HttpQueryInfoW`) and sends json creds to an auth endpoint.
-2. after that it opens one long-lived tcp connection (`CPrimaryTcp`) that carries
-   all the binary packets, chat, rooms, presence, everything. there's also a udp
-   path (`CPrimaryUdp`) for nat punching / p2p / voice. it links the udt4 lib for
-   the reliable-udp stuff.
+```
+[4-byte length, little-endian] [1-byte opcode] [payload...]
+```
 
-### the "processor" list (this is basically the whole protocol's table of contents)
+the length covers everything after the length field (opcode + payload).
+
+confirmed live: username "evelyn" came through as
+`0d000000 0a0100fc3000 6576656c796e00` — `0x0d` = 13 = the byte count after the
+length field.
+
+strings inside packets are **null-terminated plaintext**, no length prefix. the
+reader literally reads bytes until it hits a `00` (confirmed from the string-reader
+function: clear(), then loop push_back until byte == 0).
+
+
+## the "processor" list (basically the protocol's table of contents)
 
 every message type has a c++ class under `ProcessorNS`, they all inherit from
-`CBaseProcessor` and have a `Process(const char* buf, int len)`. i pulled the
-full list out of the symbol table. just from the names you can see the whole
-feature set:
+`CBaseProcessor` and have a `Process(const char* buf, int len)`. pulled the full
+list out of the symbol table. just from the names you can see the whole feature set:
 
 auth / session:
 - `CUserAuthPreLoginProcessor` (step 1 of the handshake)
-- `CUserAuthLoginProcessor` (step 2, the login reply, this is the one i analysed)
+- `CUserAuthLoginProcessor` (step 2, the login reply, the one i analysed)
 - `CUserAuthLoginInfoProcessor` (step 3, account info)
 - `CRefreshTokenProcessor`, `CAccountSecurityProcessor`, `CVersionConfirmProcessor`
 
@@ -121,14 +175,121 @@ user / misc / infra:
   `CXimCmdProcessor`, `CFileTransferExProcessor`,
   `COfflineFileUploadedProcessor`, `CBaseProcessor` (the base class)
 
-todo: find the dispatcher in `tcpdatahandler.cpp` that maps opcode -> processor.
-that's where the actual numeric packet ids live. probably look at how the
-`CBaseProcessor` subclasses get registered / constructed.
+
+## the dispatch table (opcode -> processor)
+
+processors register themselves into a global table via `Dispatch_Register`
+(ghidra `FUN_00a8f050`). each registration looks like:
+
+```
+opcode = 0xNN
+table  = Dispatch_GetTable()        // FUN_00a8efb0
+Dispatch_Register(table, opcode, processor_instance)
+```
+
+to get a processor's opcode: find its constructor, find who calls it (xref), that
+caller has the `Dispatch_Register` line with the number.
+
+known opcodes so far:
+- `0x0a` -> pre-login (client->server)
+- `0xee` -> CErrorProcessor
+- `0xc1` -> CNotificationProcessor
+
+**finding ALL the `Dispatch_Register` calls = the entire opcode table for every
+processor.** that's the next big job and it unlocks every packet type at once.
 
 
-## the crypto (i traced it in the disassembly woo hoo :clap:)
+## packets i've mapped
+
+### pre-login (client -> server) — CONFIRMED LIVE
+
+the very first packet the client sends after connecting. captured it by typing
+different usernames and watching the bytes change.
+
+```
+[4-byte length] 0a 01 00 fc 30 00 <username>\0
+```
+
+- opcode `0x0a`
+- fixed 6-byte header `0a 01 00 fc 30 00` (constant across every attempt)
+- username as null-terminated ascii, plaintext
+
+examples:
+- "evelyn" -> `0d000000 0a0100fc3000 6576656c796e00`
+- "lily"   -> `0b000000 0a0100fc3000 6c696c7900`
+
+this is step 1, before any password. server is meant to reply with crypto/session
+setup, THEN the client sends the password in a later packet (not captured yet).
+
+### pre-login reply (server -> client) — format from ghidra
+
+handler: `CUserAuthPreLoginProcessor::Process`. parsed as:
+
+```
+[opcode] [int] [int] [string] [string]
+```
+
+two ints, then two null-terminated strings. the two strings get fed into crypto
+transforms (`FUN_007a06a0` / `FUN_0079c7e0`) — probably the key-exchange material.
+haven't cracked what they should contain.
+
+### error packet (server -> client) — CONFIRMED LIVE, opcode 0xee
+
+handler: `CErrorProcessor::Process`. format:
+
+```
+[4-byte length] ee [4-byte error code, LE] [message bytes...]
+```
+
+- opcode `0xee` (registered via Dispatch_Register with 0xee)
+- 4-byte error code feeds the `ProcessSignInError` switch
+- the message bytes after the code are read plaintext BUT the client IGNORES them
+  and shows its own built-in localized string for that code instead. so you do
+  NOT get custom text out of this packet — you pick the code + which built-in
+  message shows. client formats it as `[Error XXXX] <built-in message>`.
+
+**this works pre-login.** send it right after the client's pre-login packet and it
+pops a message box. confirmed on screen.
+
+error code -> what the client shows (from ProcessSignInError):
+- `0x11` -> "invalid version" (triggers update)
+- `0x21` -> **"wrong username or password"** (confirmed live, the good one)
+- `0x31` -> error + opens support url
+- `0x52` -> generic login error
+- `0x65` -> "insecure password" + opens account page
+- `0x66` -> error + opens security center
+- `0x70` -> "login parameter error"
+- anything else (default) -> "cannot connect with Garena+ server"
+
+### notification packet (server -> client) — format mapped, opcode 0xc1
+
+handler: `CNotificationProcessor::Process`. format:
+
+```
+[4-byte length] c1 [4-byte count] (then 'count' notification items)
+```
+
+each item (some field sizes still guessed):
+```
+[1 byte type?] [4-byte int] [4-byte int] [1 byte] [1 byte] [string1]\0 [string2]\0
+```
+
+the two strings ARE displayed as-is (title + body) = this is the real custom-text
+vector, unlike the error packet.
+
+**BUT** it only displays when the client is logged in / in-session. sending a
+`0xc1` packet pre-login does nothing — tested live, well-formed packet -> no popup.
+so custom notification text needs the full login handshake working first.
+
+
+## the crypto (traced it in the disassembly woo hoo :clap:)
 
 this is the most done part and it's the key to everything for a server.
+
+note: incoming pre-login / error / notification packets are NOT transport-encrypted
+(confirmed live — plaintext packets i sent were processed fine). the XTEA-CBC stuff
+applies to the auth login REPLY body specifically. still need to map exactly which
+packets are encrypted vs plaintext.
 
 ### rsa key exchange
 
@@ -206,7 +367,7 @@ todo: figure out how the session key is actually derived.
   encoding tokens/keys as text
 
 
-## the http / json login
+## the http / json login (the config/check side, NOT the real login)
 
 ### transport
 
@@ -225,9 +386,13 @@ object (field at `+0xC4`) and built from a base domain.
 - base domain is `garenanow.com` (confirmed from subdomains in the room language
   xmls: `cdn.garenanow.com`, `ad.garenanow.com`)
 - also saw `sng.garena.com` and `forum.sng.garena.com`
-- the actual auth subdomain (like `something.garenanow.com`) is built in code by
-  sticking a prefix in front of the base domain, so it's not one greppable string.
-  todo: find that prefix.
+- the actual auth subdomain is built in code by sticking a prefix in front of the
+  base domain, so it's not one greppable string. todo: find that prefix.
+
+http config hosts the client hits on launch/login:
+- `cdn.garenanow.com/im/config/*.xml` (config, STILL ALIVE, serves real files)
+- `updateres.garenanow.com/im/versions.xml` (version, dead)
+- `imcheck.garenanow.com/serverstatus.php` (status, hit on login, dead)
 
 ### the json (confirmed, found the actual templates in the binary around offset ~8350560)
 
@@ -240,8 +405,6 @@ the client builds these json shapes, field names are straight from the binary:
 // password change uses: "old_pwd", "new_pwd"
 ```
 
-so auth is json over http(s), and the body or session key is probably
-rsa/symmetric wrapped. way easier to deal with than the old binary protocol.
 todo: figure out exactly what's encrypted and how the password is hashed (md5 is
 linked, old client used plain md5 hex, need to verify).
 
@@ -283,29 +446,30 @@ dependency order. none of this is built yet, it's just the plan.
 2. patch the client's embedded public key (offset `8350309`) with ours. keep it
    1024-bit so the length stuff doesn't break, or patch the length fields too.
    this is the patcher tool.
-3. point the client at our server. easiest is the hosts file mapping the auth
-   subdomain to our ip (need to find the subdomain first). or patch the domain
-   handling.
+3. point the client at our server. for the IM tcp side this already works via the
+   hosts file (`live.imconnect.garenanow.com` -> our ip, port 9100). still need
+   the http auth subdomain for the http side.
 4. reverse the rest of the auth crypto (how the json/session key is wrapped,
-   password hashing, the timestamp thing)
+   password hashing, the timestamp thing, the pre-login reply key exchange)
 5. write the server:
-   - http(s) endpoint that takes the json login
-   - rsa decrypt the session key with our private key
-   - check creds, build a valid login reply (status byte + 4/16/4 payload),
-     xtea-cbc encrypted
-   - tcp listener that speaks the primarytcp framing for after login
+   - tcp listener on 9100 speaking the framing `[4-byte len][opcode][payload]`
+   - answer the `0x0a` pre-login, do the key exchange, accept the password
+   - build a valid login reply (status byte + 4/16/4 payload), xtea-cbc encrypted
+   - http(s) endpoint for the json side if needed
 6. then build outward, keepalive, buddy list, chat, groups, one processor family
    at a time
 
-first thing to actually aim for: get the real client to connect to a server we
-control and just log the raw bytes. don't even worry about replying correctly
-yet. seeing the real prelogin bytes show up makes everything after it way less
-guessy.
+already done: get the real client to connect to a server we control and log the
+raw bytes (the prelogin packet). that made everything after it way less guessy.
 
 
 ## stuff i still need to figure out
 
-- [ ] the opcode -> processor dispatch table in `tcpdatahandler.cpp` (gives the packet ids)
+- [ ] the FULL opcode -> processor dispatch table (all `Dispatch_Register` calls).
+      i have the mechanism + 3 opcodes (0x0a, 0xee, 0xc1), need the rest
+- [ ] the pre-login reply / key exchange (the two crypto strings) so the client
+      proceeds to send the password
+- [ ] the password packet (client -> send side, not captured yet)
 - [ ] reverse `CAuthLoginAction::PreAuthLogin` and `AuthLogin` (the send side).
       ghidra didn't label these, only rtti/strings, so reach them via xrefs from
       the `loginaction.cpp` string or the json templates
@@ -313,7 +477,8 @@ guessy.
       `securitymanager.cpp`)
 - [ ] how the password is hashed (md5? salt?)
 - [ ] the auth subdomain prefix in front of `garenanow.com`
-- [ ] the `CPrimaryTcp` framing (header size, endianness, where the opcode sits)
+- [ ] which packets are encrypted vs plaintext (error/notify/prelogin are plaintext,
+      auth reply is xtea, need the full map)
 - [ ] whether that 16-byte reply field is a token or a key
 
 
@@ -329,6 +494,19 @@ guessy.
 | `0x00457da0` | `FUN_00457da0` | `Decrypt_Wrapper` | decrypt entry wrapper |
 | `0x007a0b40` | `FUN_007a0b40` | `Decrypt_CBC` | xtea-cbc + padding check |
 | `0x007a0810` | `FUN_007a0810` | `XTEA_DecryptBlock` | the actual xtea, 32 rounds |
+| `0x0044c510` | `FUN_0044c510` | `IMServer_LoadConfig` | reads im_server_domain + im_server_port (runtime 0x00BDC510) |
+| `0x005dc180` | `FUN_005dc180` | `Config_GetString` | config key -> value, returns "" if missing |
+| `0x00a8f050` | `FUN_00a8f050` | `Dispatch_Register` | table[opcode] = processor |
+| `0x00a8efb0` | `FUN_00a8efb0` | `Dispatch_GetTable` | returns the dispatch table |
+| `0x00456360` | `FUN_00456360` | `PreLoginProcessor_Process` | parses prelogin reply [int][int][str][str] |
+| `0x004c0e40` | `FUN_004c0e40` | `ErrorProcessor_Process` | parses 0xee error packet |
+| `0x004c1fa0` | `FUN_004c1fa0` | `Register_ErrorProcessor` | registers 0xee |
+| `0x004c20e0` | `FUN_004c20e0` | `NotificationProcessor_Process` | 0xc1 entry |
+| `0x004c2140` | `FUN_004c2140` | `NotificationProcessor_Process_Impl` | parses the notify list |
+| `0x004c2a70` | `FUN_004c2a70` | `NotifyList_Parse` | reads count + loops items |
+| `0x004c36a0` | `FUN_004c36a0` | `Notification_ParseItem_Impl` | reads item fields + 2 strings |
+| `0x004c3e40` | `FUN_004c3e40` | `Register_NotificationProcessor` | registers 0xc1 |
+| `0x004566d0` | `FUN_004566d0` | `PacketReader_ReadString` | null-terminated string reader |
 
 (also renamed a bunch of in-between wrapper functions: `Decrypt_Inner`,
 `Decrypt_Wrapper3`, `Decrypt_Dispatch`, `Decrypt_Unwrap`, `Buffer_CopyRange`,
@@ -342,8 +520,16 @@ guessy.
   the best ghidra anchors. search the string, follow its xref, you land in the function
 - ghidra didn't name a lot of the c++ methods (only had rtti/vftable). you get to
   the real function through the class vftable (its entries are the methods) or by
-  xref from a string the function uses
+  xref from a string the function uses. slot [2] in the vftable was usually Process
+- to find a packet's opcode: find the processor's constructor, find who calls it
+  (xref), that caller has the `Dispatch_Register(table, opcode, ...)` line
 - use `Window -> Symbol Table` and UNCHECK "name only", it's way more reliable
   than the symbol tree filter
+- for live capture: hosts file redirect + a dumb python tcp listener on the port.
+  print what the client sends, reply with guessed packets, watch what it does.
+  that's how i got the framing, the prelogin packet, and the wrong-password error
+- x32dbg to watch values live: breakpoint the function, F8 to step over, read the
+  registers/stack. that's how i found the real server domain was
+  `live.imconnect.garenanow.com` and the port 9100
 - rename everything the second you figure it out. the ghidra database basically
   becomes your notes
