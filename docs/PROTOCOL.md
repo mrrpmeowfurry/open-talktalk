@@ -533,3 +533,369 @@ raw bytes (the prelogin packet). that made everything after it way less guessy.
   `live.imconnect.garenanow.com` and the port 9100
 - rename everything the second you figure it out. the ghidra database basically
   becomes your notes
+
+
+## the full opcode table (pulled straight from the binary)
+
+got the whole thing by finding every call to `Dispatch_Register` (79 of
+them) and reading the opcode pushed before each call, then following the
+register fn into the constructor to get the processor class via RTTI.
+sanity check passed: the ones i'd already found by hand (0x0a, 0x0c, 0x21,
+0xee, 0xc1) all matched.
+
+5 of them my script couldn't auto-resolve (0x17, 0x60, 0x72, 0x7a, and 0xc1
+which i already know is CNotificationProcessor from tracing it live). the
+other 4 i'll fill in by hand later - go to the call site, follow the constructor.
+
+opcodes are the 1-byte value right after the 4-byte length in a packet.
+
+| opcode | processor |
+|--------|-----------|
+| `0x0a` | CUserAuthPreLoginProcessor |
+| `0x0b` | CUserAuthPreLoginProcessor |
+| `0x0c` | CUserAuthLoginProcessor |
+| `0x11` | CBuddyListProcessor |
+| `0x12` | CBuddyOnlineProcessor |
+| `0x13` | CBuddyAddRequestProcessor |
+| `0x15` | CCategoryProcessor |
+| `0x16` | CBuddyRemoveProcessor |
+| `0x17` | ??? (todo: resolve by hand) |
+| `0x18` | CBuddyBlockProcessor |
+| `0x19` | CBuddyAddTempProcessor |
+| `0x1c` | CNudgeProcessor |
+| `0x1e` | CBuddyBlockProcessor |
+| `0x1f` | CSuggestedBuddiesProcessor |
+| `0x21` | CChatProcessor |
+| `0x24` | CChatConfirmProcessor |
+| `0x27` | CTypingStatusExProcessor |
+| `0x33` | CFileTransferExProcessor |
+| `0x35` | COfflineFileUploadedProcessor |
+| `0x40` | CRequestTempGroupIdProcessor |
+| `0x41` | CAddTempGroupMemberProcessor |
+| `0x42` | CTempGroupChatProcessor |
+| `0x43` | CLeaveTempGroupProcessor |
+| `0x45` | CJoinTempGroupProcessor |
+| `0x46` | CTempGroupChatConfirmProcessor |
+| `0x47` | CGetUserTempGroupsProcessor |
+| `0x48` | CGetUserClansProcessor |
+| `0x49` | CClanInfoProcessor |
+| `0x4a` | CClanChatProcessor |
+| `0x4b` | CClanChatConfirmProcessor |
+| `0x4c` | CClanInviteProcessor |
+| `0x4e` | CClanMemberJoinProcessor |
+| `0x50` | CCateCreateResultProcessor |
+| `0x51` | CCateChangeProcessor |
+| `0x52` | CCateRemoveProcessor |
+| `0x53` | CCateRenameProcessor |
+| `0x5a` | CClanMemberStatusProcessor |
+| `0x5b` | CClanMemberActionProcessor |
+| `0x5d` | CNotifyClanProcessor |
+| `0x5e` | CClanSearchProcessor |
+| `0x60` | ??? (todo: resolve by hand) |
+| `0x61` | CUserInfoListProcessor |
+| `0x62` | CUserInfoByNameProcessor |
+| `0x63` | CUserChangeStatusProcessor |
+| `0x64` | CGetSignatureProcessor |
+| `0x65` | CUserChangeNicknameProcessor |
+| `0x66` | CQueryUserOptionProcessor |
+| `0x68` | CGetRenameProcessor |
+| `0x69` | CUserGamesInfoProcessor |
+| `0x70` | CGroupInfoProcessor |
+| `0x72` | ??? (todo: resolve by hand) |
+| `0x73` | CGroupChatProcessor |
+| `0x75` | CGroupInviteProcessor |
+| `0x77` | CGroupMemberJoinProcessor |
+| `0x78` | CQueryMemberStatusProcessor |
+| `0x7a` | ??? (todo: resolve by hand) |
+| `0x81` | CGetUserGroupsProcessor |
+| `0x82` | CGroupChatConfirmProcessor |
+| `0x8a` | CSystemGroupProcessor |
+| `0x90` | CGetSignatureProcessor |
+| `0x92` | CUserPersonalInfoProcessor |
+| `0x94` | CGCAInfoProcessor |
+| `0x96` | CMiscInfoProcessor |
+| `0x97` | CUserSettingRequestProcessor |
+| `0x98` | CUserSettingProcessor |
+| `0x99` | CRefreshTokenProcessor |
+| `0x9a` | CAccountSecurityProcessor |
+| `0x9b` | CGPPSelfInfoProcessor |
+| `0x9c` | CGPPSelfInfoProcessor |
+| `0xb0` | CMakeHoleRequestProcessor |
+| `0xb1` | CMakeHoleAckProcessor |
+| `0xc0` | CExtendProcessor |
+| `0xc1` | CNotificationProcessor  (confirmed live) |
+| `0xc3` | CGetRenameProcessor |
+| `0xc4` | CCcuUpdateProcessor |
+| `0xe0` | CProductInfoProcessor |
+| `0xe1` | CPaymentResultProcessor |
+| `0xe4` | CXimCmdProcessor |
+| `0xee` | CErrorProcessor |
+
+note: a couple show the same class for two opcodes (0x0a/0x0b both prelogin,
+0x9b/0x9c both gpp self info) - could be a request/response pair sharing a
+processor, or my resolver grabbed a neighbor. worth double checking those.
+
+
+## cracking the pre-login reply (the login gate) - DEEP DIVE
+
+this is the big blocker for real login. when the client sends the 0x0a pre-login
+(username), it waits for the server reply, and ONLY proceeds to send the password
+if the reply passes a bunch of checks. confirmed live: if the reply is incomplete/
+wrong, the client does `connection reset by peer` (hangs up) and never sends the
+password. so we have to send a reply it accepts.
+
+### the crypto the reply strings go through (CONFIRMED from disasm)
+
+the pre-login reply is `[opcode][int][int][string1][string2]` (parsed by
+PreLoginProcessor_Process, no validation in the parse itself). the two strings get
+run through:
+- **SHA-256** (confirmed - the init constants at 0xd005d8 are the exact SHA-256
+  IVs: 6a09e667 bb67ae85 3c6ef372 a54ff53a 510e527f 9b05688c 1f83d9ab 5be0cd19).
+  the hash is the init/update/final at 0x79e500.
+- then **hex encode** (lowercase, table "0123456789abcdef" at 0xbf887c).
+
+so the client computes `hex(sha256( secret + string1 ))` then chains
+`hex(sha256( that + string2 ))`. the `secret` comes from a field on the session
+object at +0x98 (Session_GetField just returns this+0x98). still need to confirm
+what's in +0x98 (probably password-derived).
+
+### what makes a reply ACCEPTED (the gate logic, CONFIRMED from disasm)
+
+after Process parses the reply it queues a task (via CTaskActionManager::UICall at
+0x44c810). that task (callback 0x9f76c0) runs the acceptance checks:
+
+1. calls gatekeeper 0x9f6210, which calls core-check 0x9f5d50:
+   - **0x9f5d50**: bytes at object +0x64, +0x6c, +0x6d, +0x6e must ALL be non-zero
+     (field-presence checks - "did we get all the pieces"). returns 1 if so.
+   - back in **0x9f6210**: also need byte +0xf9 == 1 AND byte +0xfa == 0.
+2. then in 0x9f76c0: status field +0xb4 must be 0, 5, or 9. anything else sets
+   error 0xd (13) and error flag +0xf8 = 1.
+
+so the acceptance criteria for a valid pre-login reply:
+- +0xb4 (status, = first int in reply?) must be 0, 5, or 9
+- +0x64, +0x6c, +0x6d, +0x6e all non-zero
+- +0xf9 == 1, +0xfa == 0
+
+note: this is NOT a crypto comparison gate - it's field-presence + status checks.
+the offsets get populated from the reply's two ints + two strings during parse.
+sending int1=0 already satisfies the status (0 is valid). the rest need the strings/
+int2 to land so +0x64/+0x6c/+0x6d/+0x6e/+0xf9 become non-zero and +0xfa stays 0.
+
+### TODO to finish login (next session, best with live debugger)
+
+- [ ] map which reply bytes set which object offset (+0x64, +0x6c..+0x6e, +0xf9,
+      +0xfa, +0xb4). breakpoint 0x9f5d50 (runtime = +module base), inspect the
+      object, see which are zero, work backwards to the reply field that feeds each
+- [ ] confirm what's in +0x98 (the hash secret) - breakpoint Session_GetField
+- [ ] once a reply passes, the client should send the password packet - capture it
+- [ ] then we know the full handshake
+
+### addresses for this (ghidra base 0x400000, runtime = +module base)
+
+| ghidra addr | what |
+|------|------|
+| 0x00456360 | PreLoginProcessor_Process (parses the reply) |
+| 0x009f76c0 | post-prelogin task callback (runs acceptance checks) |
+| 0x009f6210 | gatekeeper (checks +0xf9==1, +0xfa==0) |
+| 0x009f5d50 | core check (+0x64/+0x6c/+0x6d/+0x6e all non-zero) |
+| 0x0079e500 | SHA-256 (init/update/final) |
+| 0x0079c7e0 | hex encode |
+| 0x0079a4d0 | password JSON builder {"password":"...","timestamp":"..."} |
+| 0x0044c810 | CTaskActionManager::UICall (queues the task) |
+
+### live behavior notes (CONFIRMED)
+
+- client sends 0x0a pre-login with plaintext username, waits for reply
+- reply opcode 0x0a or 0x0b both route to the same processor (opcode value doesn't
+  matter for routing)
+- send a reply with placeholder strings -> client does `connection reset by peer`
+  (rejected because the flag fields didn't get populated right)
+- the password JSON builder (0x79a4d0) is gated behind a valid pre-login reply -
+  breakpoint there never fires until the reply is accepted
+- HEADS UP: attaching x32dbg triggers anti-debug noise (repeated EXCEPTION_BREAKPOINT
+  at kernelbase, ggspawn.dll is involved). for watching network behavior, run the
+  client WITHOUT the debugger - the proxy terminal shows what you need. only attach
+  the debugger when you specifically need to read memory.
+
+
+### gate internals - how the acceptance fields get set (DEEPER, from disasm)
+
+traced the field-parser at 0x9f5ad0 and the reply sub-parser at 0x9f5c10. how each
+required field gets its value:
+
+- **+0x64 and +0x6c** come from a flags field at +0x60:
+  - `+0x6c = (obj[+0x60] & 4) ? 1 : 0`  (needs bit 2 set)
+  - `+0x64 = (obj[+0x60] & 1) ? 1 : 0`  (needs bit 0 set)
+  - +0x60 is set from `[parsed+8]` where 'parsed' comes from sub-parser 0x79a180
+    operating on reply data. so the reply must encode a flags value with bits 0
+    AND 2 set (i.e. flags & 5 == 5) to make +0x64 and +0x6c both non-zero.
+- **+0x6d** = return of 0x9f5bd0, which just reads a pre-set byte obj[+0x25]
+- **+0x6e** = return of 0x6765d0 (a capability check), can also be forced to 1
+- **+0xb4** (status) = first int region, must be 0, 5, or 9
+- **+0xf9=1, +0xfa=0** = set on the success path at 0x9f60b7/0x9f60c1
+
+KEY INSIGHT: the two strings in the reply aren't used raw - they get further parsed
+by 0x79a180 into a sub-structure that has a flags field. so the reply format is
+deeper than [int][int][str][str]; the strings contain encoded sub-fields (flags +
+tokens). need to reverse 0x79a180 OR (faster) watch it live.
+
+### fastest way to finish (next session, LIVE debugger)
+
+breakpoint these and send a reply, watch what your bytes become:
+- 0x9f5cf2  (calls sub-parser 0x79a180 on reply data -> sets +0x60 flags)
+- 0x9f5d19  (+0x6c set from flags bit 2)
+- 0x9f5d2e  (+0x64 set from flags bit 0)
+- 0x9f5ad0  (the field-parser entry)
+inspect the object (ecx/[ebp-4]/[ebp-0x10]) at these points to see the flags value
+and which reply bytes produced it. that gives the exact string format to send.
+remember: run client WITHOUT debugger for network tests; only attach to read memory.
+
+new function names this session:
+| ghidra addr | name |
+|------|------|
+| 0x009f76c0 | PostPreLogin_TaskCallback |
+| 0x009f6210 | PreLogin_Gatekeeper (checks +0xf9==1, +0xfa==0) |
+| 0x009f5d50 | PreLogin_CoreCheck (+0x64/+0x6c/+0x6d/+0x6e non-zero) |
+| 0x009f5ad0 | PreLogin_FieldParser |
+| 0x009f5c10 | PreLogin_ReplySubParser (sets +0x60 flags) |
+| 0x0079a180 | Reply_StringParser (parses the reply strings into sub-struct) |
+| 0x0079e500 | SHA256_Hash |
+| 0x0079c7e0 | Hex_Encode |
+| 0x0079a4d0 | Build_PasswordJSON |
+
+
+### FULL login gate map - what sets each field (COMPLETE, from CLoginWindow::OnBtnLogin)
+
+found the real login button handler: CLoginWindow::OnBtnLogin at 0x7f9970 (in
+loginwindow.cpp). it ties everything together. key finding: MOST of the acceptance
+fields are computed LOCALLY from the typed password + machine, NOT from the server
+reply. so they were never our rejection cause.
+
+password handling: FUN_00678a50(out_flags, password, username) at 0x678a50 is a
+password STRENGTH/COMPOSITION check (returns a status, logged as "password input
+with status: N"). it sets flag bits:
+- bit 0 (->field +0x64): password length < 8
+- bit 2 (->field +0x6c): password character-composition check (regex [...]|[...])
+these are LOCAL checks on the typed password. real login w/ a real password sets
+them. the [ ... ] | strings at 0xbe27c0/0xbe2760/0xbe26c0 are password-rule regexes.
+
+so the acceptance fields break down as:
+- +0x64, +0x6c   = local password property checks (FUN_00678a50)   <- not server-controlled
+- +0x6d, +0x6e   = local capability / registry / hardware checks   <- not server-controlled
+- +0xb4 (status) = from +0x68, PARSED FROM THE SERVER REPLY, must be 0/5/9  <- SERVER controls
+- +0xf9=1,+0xfa=0= success flags, set only when the reply parse COMPLETES OK   <- SERVER controls
+
+### CONCLUSION: what a valid pre-login reply actually needs
+
+the only things our server reply must do:
+1. parse successfully (the two strings must have the structure FUN_0079a180 expects)
+2. produce status +0x68 in {0, 5, 9}
+
+our AAAA/BBBB placeholder failed because the strings weren't the structure the
+parser wants (so parse failed / status garbage). this is NOT a crypto gate and NOT
+a many-field gate - it's "send a well-formed reply with a good status".
+
+### THE remaining unknown + fastest way to get it
+
+the exact structure FUN_0079a180 (0x79a180) expects inside the two reply strings.
+it's built from many small string ops (hard to read statically). 
+
+FASTEST: breakpoint 0x79a180 live, send our reply, single-step / watch it parse the
+AAAA string and see exactly where it bails and what delimiter/structure it wants.
+that gives the string format in minutes. then craft a reply with valid structure +
+status 0 and the client should accept it and send the password.
+
+new names this session:
+| ghidra addr | name |
+|------|------|
+| 0x007f9970 | CLoginWindow::OnBtnLogin (the login button handler, ties it together) |
+| 0x00678a50 | PasswordStrengthCheck(out_flags, pwd, user) - local pwd checks |
+| 0x009f6e30 | SetLoginResult(this, user, cred, ival, status, byte) - sets +0xb4 etc |
+
+
+### THE PASSWORD TRANSFORM - CRACKED (FUN_0079a770)
+
+found how the password is encoded before it goes on the wire. in the normal login
+path, CLoginWindow::OnBtnLogin calls FUN_0079a770(password, out) at 0x79a770.
+
+the pipeline:
+1. init a SHA-256 context (0x689430 -> 0x6894c0 -> ...; block size 0x40=64 confirmed
+   at 0x68a810, and the ONLY hash IV table in the whole binary is the SHA-256 one
+   at 0xd005d8, so it's definitely SHA-256)
+2. feed the password bytes (0x689510)
+3. finalize -> 32-byte digest
+4. hex-encode (0x79c2d0, sibling of the hex encoder 0x79c7e0)
+5. output = **hex(sha256(password))** - a 64-char lowercase hex string
+
+so the password is sent as `hex(sha256(password))`. NO md5 (none in the binary),
+NO salt at this stage, NO RSA on the password itself (RSA is only for wrapping the
+session key separately).
+
+this is consistent with the pre-login reply crypto (also hex(sha256(...))). the
+whole auth is SHA-256 + hex. very replicable in python.
+
+test vectors (verify live by breakpointing 0x79a770 and logging in):
+- hex(sha256("test123")) = ecd71870d1963316a97e3ac3408c9835ad8cf0f3c1bc703527c30265534f75ae
+- hex(sha256("test"))    = 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+- hex(sha256("evelyn"))  = 44e5bf55761da5636a92efd9e8cafe3cf3454d9799b09826406cbf7718ed2676
+
+### auth crypto summary (what we know now)
+
+- password on wire = hex(sha256(password))
+- pre-login reply challenge response = hex(sha256(secret + serverstring)), chained
+- session key wrap = RSA-1024 with the embedded public key (separate from password)
+- transport cipher (post-login) = XTEA-CBC
+- everything hashing = SHA-256, everything encoding = lowercase hex
+
+new names:
+| ghidra addr | name |
+|------|------|
+| 0x0079a770 | EncodePassword = hex(sha256(pwd)) |
+| 0x00689430 | SHA256_Ctx_Init |
+| 0x00689510 | SHA256_Feed |
+| 0x0079c2d0 | (hex encode sibling) |
+
+
+### patching + the pre-login reply wall (session notes)
+
+built patch.sh: patches PreLogin_Gatekeeper @ 0x9f6210 (file offset 0x5f5610),
+bytes 55 8B EC -> B0 01 C3 (mov al,1; ret) to force the gate to always pass.
+RESULT: patched client STILL resets after our reply. so the gate was NOT the
+blocker.
+
+domain swap (live.imconnect.garenanow.com -> open-talktalk.mrrpmeowfurry.dev):
+NOT possible by patching the exe - the domain is NOT stored as a string in the
+binary (comes from the runtime config store, im_server_domain). also the new domain
+(31 chars) is longer than the old (28) so an in-place swap wouldn't fit anyway.
+just use the hosts file redirect (already works). a real domain swap needs finding
+where im_server_domain is seeded at runtime - separate harder task, cosmetic only.
+
+things RULED OUT this session for "why does the client reset on our reply":
+- NOT xtea decryption: Decrypt_CBC (0x7a0b40) is only called from 0x4568be and
+  0x456da9 (both in the LOGIN processor 0x456xxx = the 0x0c login reply). pre-login
+  (0x0a/0x0b) replies are NOT transport-encrypted. so plaintext reply is fine.
+- NOT the gatekeeper: patched it to always-pass, no change.
+- NOT the status int: tried int1 = 0, 2, 4 (which map to status 0/5/9), all reset.
+
+CONCLUSION: the client resets because our reply doesn't PARSE as a valid pre-login
+reply. the reset is fast = frame/parse-level rejection, before the gate logic. the
+exact byte structure of a valid reply (esp. what's inside the two strings) is the
+one thing static analysis hasn't cleanly given - it's built from nested string
+parsing that's hard to read statically.
+
+### THE live battle plan to crack the reply format (do this next)
+
+1. run the client UNDER x32dbg (accept the anti-debug noise, just hit run past the
+   EXCEPTION_BREAKPOINTs, or add 80000003 to ignored exceptions in preferences).
+2. breakpoint PreLoginProcessor_Process: bp GarenaMessenger.exe:$56360
+3. run prelogin proxy (any version), log in.
+4. when the bp hits, SINGLE-STEP (F8) through the parse and watch:
+   - the buffer pointer/contents it's reading
+   - exactly which instruction it bails/throws on with our AAAA/"0" data
+   - what it expected vs what we sent
+5. that one observation gives the exact reply structure. then craft a reply that
+   parses, and the client should accept it and send the 0x0c login packet (which
+   will contain hex(sha256(password)) - verify against the test vectors above).
+
+everything else for login is already cracked (crypto, password transform, opcode
+table, gate). this reply format is the last lock.
